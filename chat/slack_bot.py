@@ -3,17 +3,21 @@ from .models import Conversation, Message
 from django.conf import settings
 import openai
 import logging
+from django.db import transaction
+from asgiref.sync import sync_to_async
+from openai import OpenAI
 
 logger = logging.getLogger(__name__)
 
 slack_app = AsyncApp(token=settings.SLACK_BOT_TOKEN)
 
+client = OpenAI(api_key=settings.OPENAI_API_KEY)
+
 class SlackBot:
     @staticmethod
-    async def handle_mention(event, say):
+    async def handle_mention(event, client):
         """
         Handles when the bot is mentioned in Slack.
-        Retrieves context, gets LLM response, and replies in the thread.
         """
         try:
             channel_id = event["channel"]
@@ -37,32 +41,44 @@ class SlackBot:
                 conversation, response, "BOT", is_bot=True
             )
 
-            await say(text=response, thread_ts=thread_ts)
-
-        except Exception as e:
-            logger.error(f"Error handling mention: {str(e)}")
-            await say(
-                text="I apologize, but I encountered an error processing your request.",
+            await client.chat_postMessage(
+                channel=channel_id,
+                text=response,
                 thread_ts=thread_ts
             )
 
+        except Exception as e:
+            logger.error(f"Error handling mention: {str(e)}")
+            try:
+                await client.chat_postMessage(
+                    channel=channel_id,
+                    text="I apologize, but I encountered an error processing your request.",
+                    thread_ts=thread_ts
+                )
+            except Exception as send_error:
+                logger.error(f"Error sending error message: {str(send_error)}")
+
     @staticmethod
-    async def _get_or_create_conversation(channel_id, thread_ts):
+    @sync_to_async
+    def _get_or_create_conversation(channel_id, thread_ts):
         """
         Retrieves existing conversation or creates a new one.
+        Now properly handles async operations.
         """
-        conversation, created = await Conversation.objects.aget_or_create(
+        conversation, created = Conversation.objects.get_or_create(
             channel_id=channel_id,
             thread_ts=thread_ts
         )
         return conversation
 
     @staticmethod
-    async def _store_message(conversation, content, user_id, is_bot=False):
+    @sync_to_async
+    def _store_message(conversation, content, user_id, is_bot=False):
         """
         Stores a new message in the database.
+        Now properly handles async operations.
         """
-        await Message.objects.acreate(
+        Message.objects.create(
             conversation=conversation,
             content=content,
             user_id=user_id,
@@ -70,17 +86,18 @@ class SlackBot:
         )
 
     @staticmethod
-    async def _get_conversation_history(conversation):
+    @sync_to_async
+    def _get_conversation_history(conversation):
         """
         Retrieves the last 5 messages from the conversation.
-        Returns them formatted for the LLM.
+        Now properly handles async operations.
         """
-        messages = await Message.objects.filter(
+        messages = Message.objects.filter(
             conversation=conversation
         ).order_by('-timestamp')[:5]
         
         formatted_history = []
-        for msg in reversed(messages):
+        for msg in reversed(list(messages)):
             role = "Assistant" if msg.is_bot else "User"
             formatted_history.append(f"{role}: {msg.content}")
             
@@ -101,7 +118,7 @@ class SlackBot:
                 {"role": "user", "content": f"Conversation history:\n{history}\n\nCurrent message: {current_message}"}
             ]
 
-            response = await openai.ChatCompletion.acreate(
+            response = await sync_to_async(client.chat.completions.create)(
                 model="gpt-3.5-turbo",
                 messages=messages,
                 temperature=0.7,
@@ -110,13 +127,15 @@ class SlackBot:
 
             return response.choices[0].message.content
 
-        except openai.error.OpenAIError as e:
-            logger.error(f"OpenAI API error: {str(e)}")
-            return "I apologize, but I'm having trouble generating a response right now."
         except Exception as e:
-            logger.error(f"Error getting LLM response: {str(e)}")
-            return "I apologize, but I'm having trouble processing your request."
-
+            error_message = str(e)
+            logger.error(f"OpenAI API error: {error_message}")
+            
+            if "insufficient_quota" in error_message:
+                return "I apologize, but I'm currently unable to process requests due to API limitations. Please contact the system administrator to resolve this issue."
+            else:
+                return "I apologize, but I'm having trouble generating a response right now. Please try again."
+        
 @slack_app.event("app_mention")
 async def handle_mention(event, say):
     await SlackBot.handle_mention(event, say)

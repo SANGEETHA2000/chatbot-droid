@@ -21,4 +21,5 @@ from chat import views
 urlpatterns = [
     path('admin/', admin.site.urls),
     path('slack/events', views.slack_events, name='slack_events'),
+    path('slack/oauth_redirect', views.slack_oauth_redirect, name='slack_oauth_redirect'),
 ]
