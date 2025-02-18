@@ -22,7 +22,12 @@ class SlackBot:
         and generates responses using the OpenAI API.
         """
         try:
-            team_id = event.get("team_id")
+            team_id = event.get("team")
+            print(f"Received event for team: {team_id}")
+            
+            if not team_id:
+                logger.error("Team ID not found in event data. Full event:", event)
+                return
 
             workspace_token = await SlackBot._get_workspace_token(team_id)
             if not workspace_token:

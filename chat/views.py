@@ -59,12 +59,21 @@ async def slack_oauth_redirect(request):
                 data = await response.json()
                 
                 if not data.get('ok'):
+                    logger.error(f"OAuth error: {data}")
                     return HttpResponse(f"Error during OAuth: {data.get('error')}", status=400)
                 
+                team_id = data['team']['id']
+                bot_token = data['access_token']
+
+                logger.info(f"Storing token {bot_token} for team: {team_id}")
+                
                 await sync_to_async(WorkspaceToken.objects.update_or_create)(
-                    team_id=data['team']['id'],
-                    defaults={'bot_token': data['access_token']}
+                    team_id=team_id,
+                    defaults={'bot_token': bot_token}
                 )
+
+                stored_token = await sync_to_async(WorkspaceToken.objects.get)(team_id=team_id)
+                logger.info(f"Successfully stored token {stored_token} for team: {team_id}")
                 
                 return HttpResponse("Successfully installed the app! You can close this window and start using the bot in your Slack workspace.")
         
