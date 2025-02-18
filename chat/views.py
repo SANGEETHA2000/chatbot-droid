@@ -6,6 +6,8 @@ import requests
 from .slack_bot import slack_app, SlackBot
 import logging
 from .models import WorkspaceToken
+from asgiref.sync import sync_to_async
+import aiohttp
 
 logger = logging.getLogger(__name__)
 
@@ -45,26 +47,26 @@ async def slack_oauth_redirect(request):
         return HttpResponse("Error: No code provided", status=400)
         
     try:
-        response = requests.post(
-            'https://slack.com/api/oauth.v2.access',
-            data={
-                'client_id': settings.SLACK_CLIENT_ID,
-                'client_secret': settings.SLACK_CLIENT_SECRET,
-                'code': code
-            }
-        )
-        
-        data = response.json()
-        
-        if not data.get('ok'):
-            return HttpResponse(f"Error during OAuth: {data.get('error')}", status=400)
-            
-        WorkspaceToken.objects.update_or_create(
-            team_id=data['team']['id'],
-            defaults={'bot_token': data['access_token']}
-        )
-        
-        return HttpResponse("Successfully installed the app!")
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                'https://slack.com/api/oauth.v2.access',
+                data={
+                    'client_id': settings.SLACK_CLIENT_ID,
+                    'client_secret': settings.SLACK_CLIENT_SECRET,
+                    'code': code
+                }
+            ) as response:
+                data = await response.json()
+                
+                if not data.get('ok'):
+                    return HttpResponse(f"Error during OAuth: {data.get('error')}", status=400)
+                
+                await sync_to_async(WorkspaceToken.objects.update_or_create)(
+                    team_id=data['team']['id'],
+                    defaults={'bot_token': data['access_token']}
+                )
+                
+                return HttpResponse("Successfully installed the app! You can close this window and start using the bot in your Slack workspace.")
         
     except Exception as e:
         return HttpResponse(f"Error during OAuth: {str(e)}", status=500)
