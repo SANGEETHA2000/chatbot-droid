@@ -5,6 +5,7 @@ import json
 import requests
 from .slack_bot import slack_app, SlackBot
 import logging
+from .models import WorkspaceToken
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +54,16 @@ async def slack_oauth_redirect(request):
             }
         )
         
-        response.raise_for_status()
+        data = response.json()
+        
+        if not data.get('ok'):
+            return HttpResponse(f"Error during OAuth: {data.get('error')}", status=400)
+            
+        WorkspaceToken.objects.update_or_create(
+            team_id=data['team']['id'],
+            defaults={'bot_token': data['access_token']}
+        )
+        
         return HttpResponse("Successfully installed the app!")
         
     except Exception as e:

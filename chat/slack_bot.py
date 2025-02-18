@@ -1,6 +1,6 @@
 import uuid
 from slack_bolt.async_app import AsyncApp
-from .models import Conversation, Message
+from .models import Conversation, Message, WorkspaceToken
 from django.conf import settings
 import openai
 import logging
@@ -22,6 +22,15 @@ class SlackBot:
         and generates responses using the OpenAI API.
         """
         try:
+            team_id = event.get("team_id")
+
+            workspace_token = await SlackBot._get_workspace_token(team_id)
+            if not workspace_token:
+                logger.error(f"No token found for team {team_id}")
+                return
+            
+            workspace_client = AsyncApp(token=workspace_token)
+
             channel_id = event["channel"]
             thread_ts = event.get("thread_ts", event["ts"])
             user_id = event["user"]
@@ -80,7 +89,7 @@ class SlackBot:
                 processed=True
             )
 
-            await client.chat_postMessage(
+            await workspace_client.client.chat_postMessage(
                 channel=channel_id,
                 text=response,
                 thread_ts=thread_ts
@@ -91,13 +100,26 @@ class SlackBot:
         except Exception as e:
             logger.error(f"Error in handle_mention: {str(e)}")
             try:
-                await client.chat_postMessage(
-                    channel=channel_id,
-                    text="I apologize, but I encountered an error processing your request.",
-                    thread_ts=thread_ts
-                )
+                if workspace_client:
+                    await workspace_client.client.chat_postMessage(
+                        channel=channel_id,
+                        text="I apologize, but I encountered an error processing your request.",
+                        thread_ts=thread_ts
+                    )
             except Exception as send_error:
                 logger.error(f"Error sending error message: {str(send_error)}")
+
+    @staticmethod
+    @sync_to_async
+    def _get_workspace_token(team_id):
+        """
+        Retrieves the bot token for a specific workspace.
+        """
+        try:
+            workspace = WorkspaceToken.objects.get(team_id=team_id)
+            return workspace.bot_token
+        except WorkspaceToken.DoesNotExist:
+            return None
 
     @staticmethod
     @sync_to_async

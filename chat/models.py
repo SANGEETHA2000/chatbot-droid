@@ -32,3 +32,8 @@ class Message(models.Model):
         indexes = [
             models.Index(fields=['conversation', 'timestamp']),
         ]
+
+class WorkspaceToken(models.Model):
+    team_id = models.CharField(max_length=100, unique=True)
+    bot_token = models.CharField(max_length=255)
+    installed_at = models.DateTimeField(auto_now_add=True)
