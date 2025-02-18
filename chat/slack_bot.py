@@ -1,3 +1,4 @@
+import uuid
 from slack_bolt.async_app import AsyncApp
 from .models import Conversation, Message
 from django.conf import settings
@@ -6,39 +7,77 @@ import logging
 from django.db import transaction
 from asgiref.sync import sync_to_async
 from openai import OpenAI
+from django.utils import timezone
 
 logger = logging.getLogger(__name__)
 
 slack_app = AsyncApp(token=settings.SLACK_BOT_TOKEN)
-
 client = OpenAI(api_key=settings.OPENAI_API_KEY)
 
 class SlackBot:
     @staticmethod
     async def handle_mention(event, client):
         """
-        Handles when the bot is mentioned in Slack.
+        Main handler for Slack mentions. Processes messages, maintains conversation history,
+        and generates responses using the OpenAI API.
         """
         try:
             channel_id = event["channel"]
             thread_ts = event.get("thread_ts", event["ts"])
             user_id = event["user"]
             message_text = event["text"]
+            event_ts = event["event_ts"]          
+            slack_message_id = f"slack_{event_ts}"
 
             conversation = await SlackBot._get_or_create_conversation(
                 channel_id, thread_ts
             )
 
+            if await SlackBot._message_exists(slack_message_id):
+                logger.info(f"Message {slack_message_id} already exists, skipping")
+                return
+
             await SlackBot._store_message(
-                conversation, message_text, user_id, is_bot=False
+                conversation=conversation,
+                content=message_text,
+                user_id=user_id,
+                is_bot=False,
+                message_id=slack_message_id,
+                processed=False
             )
 
             history = await SlackBot._get_conversation_history(conversation)
             
-            response = await SlackBot._get_llm_response(message_text, history)
+            formatted_messages = [
+                {"role": "system", "content": """You are a helpful assistant in a Slack channel.
+                    Maintain context from the conversation history and be consistent with previous responses.
+                    If you're referring to information from earlier in the conversation, mention that you're 
+                    recalling it from our previous discussion."""}
+            ]
+
+            for msg in history:
+                role = "assistant" if msg.is_bot else "user"
+                formatted_messages.append({
+                    "role": role,
+                    "content": msg.content
+                })
+
+            formatted_messages.append({
+                "role": "user",
+                "content": message_text
+            })
+
+            response = await SlackBot._get_llm_response(formatted_messages)
+
+            bot_message_id = f"bot_{event_ts}_{uuid.uuid4().hex[:8]}"
 
             await SlackBot._store_message(
-                conversation, response, "BOT", is_bot=True
+                conversation=conversation,
+                content=response,
+                user_id="BOT",
+                is_bot=True,
+                message_id=bot_message_id,
+                processed=True
             )
 
             await client.chat_postMessage(
@@ -47,8 +86,10 @@ class SlackBot:
                 thread_ts=thread_ts
             )
 
+            await SlackBot._mark_message_processed(conversation, slack_message_id)
+
         except Exception as e:
-            logger.error(f"Error handling mention: {str(e)}")
+            logger.error(f"Error in handle_mention: {str(e)}")
             try:
                 await client.chat_postMessage(
                     channel=channel_id,
@@ -60,71 +101,79 @@ class SlackBot:
 
     @staticmethod
     @sync_to_async
-    def _get_or_create_conversation(channel_id, thread_ts):
+    def _message_exists(message_id):
         """
-        Retrieves existing conversation or creates a new one.
-        Now properly handles async operations.
+        Check if a message with this ID already exists in any conversation.
+        This prevents duplicate processing across all conversations.
         """
-        conversation, created = Conversation.objects.get_or_create(
-            channel_id=channel_id,
-            thread_ts=thread_ts
-        )
-        return conversation
+        return Message.objects.filter(message_id=message_id).exists()
 
     @staticmethod
     @sync_to_async
-    def _store_message(conversation, content, user_id, is_bot=False):
+    def _get_or_create_conversation(channel_id, thread_ts):
         """
-        Stores a new message in the database.
-        Now properly handles async operations.
+        Retrieves existing conversation or creates a new one.
         """
-        Message.objects.create(
-            conversation=conversation,
-            content=content,
-            user_id=user_id,
-            is_bot=is_bot
-        )
+        with transaction.atomic():
+            conversation, created = Conversation.objects.get_or_create(
+                channel_id=channel_id,
+                thread_ts=thread_ts
+            )
+            return conversation
+
+    @staticmethod
+    @sync_to_async
+    def _store_message(conversation, content, user_id, is_bot=False, message_id=None, processed=False):
+        """
+        Stores a message with transaction safety.
+        """
+        with transaction.atomic():
+            Message.objects.create(
+                conversation=conversation,
+                content=content,
+                user_id=user_id,
+                is_bot=is_bot,
+                message_id=message_id,
+                processed=processed,
+                timestamp=timezone.now()
+            )
+
+    @staticmethod
+    @sync_to_async
+    def _mark_message_processed(conversation, message_id):
+        """
+        Marks a message as processed using a safe update operation.
+        """
+        with transaction.atomic():
+            Message.objects.filter(
+                conversation=conversation,
+                message_id=message_id
+            ).update(processed=True)
 
     @staticmethod
     @sync_to_async
     def _get_conversation_history(conversation):
         """
-        Retrieves the last 5 messages from the conversation.
-        Now properly handles async operations.
+        Retrieves the last 5 messages from the conversation in chronological order.
         """
         messages = Message.objects.filter(
             conversation=conversation
         ).order_by('-timestamp')[:5]
         
-        formatted_history = []
-        for msg in reversed(list(messages)):
-            role = "Assistant" if msg.is_bot else "User"
-            formatted_history.append(f"{role}: {msg.content}")
-            
-        return "\n".join(formatted_history)
+        return list(reversed(messages))
 
     @staticmethod
-    async def _get_llm_response(current_message, history):
+    async def _get_llm_response(messages):
         """
-        Gets response from OpenAI's API with conversation context.
+        Gets response from OpenAI's API.
         """
         try:
-            system_prompt = """You are a helpful assistant in a Slack channel. 
-            Respond concisely and professionally while maintaining context 
-            from the conversation history."""
-
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Conversation history:\n{history}\n\nCurrent message: {current_message}"}
-            ]
-
             response = await sync_to_async(client.chat.completions.create)(
                 model="gpt-3.5-turbo",
                 messages=messages,
                 temperature=0.7,
                 max_tokens=500
             )
-
             return response.choices[0].message.content
 
         except Exception as e:
@@ -135,7 +184,7 @@ class SlackBot:
                 return "I apologize, but I'm currently unable to process requests due to API limitations. Please contact the system administrator to resolve this issue."
             else:
                 return "I apologize, but I'm having trouble generating a response right now. Please try again."
-        
+
 @slack_app.event("app_mention")
 async def handle_mention(event, say):
     await SlackBot.handle_mention(event, say)
