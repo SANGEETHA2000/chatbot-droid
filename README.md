@@ -1,4 +1,4 @@
-# Sangeetha's Droid - AI-Powered Slack Assistant
+# Slack Droid - AI-Powered Slack Assistant
 
 A Slack chatbot that leverages OpenAI's API to provide intelligent responses while maintaining conversation context. The bot remembers the last 5 messages of any conversation, allowing it to provide contextually relevant responses.
 
